@@ -1,0 +1,68 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# --- Virtual Environments ---
+venv/
+env/
+ENV/
+.venv/
+
+# --- Jupyter Notebooks ---
+.ipynb_checkpoints/
+
+# --- Logs & Debug ---
+*.log
+*.out
+*.err
+*.tmp
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS Files ---
+.DS_Store
+Thumbs.db
+
+# --- Unit Test / Coverage ---
+.coverage
+.tox/
+.nox/
+.pytest_cache/
+htmlcov/
+
+# --- Config / Secrets ---
+*.env
+.env.*
+config.yaml
+config.json
+
+# --- Data / Models ---
+data/
+datasets/
+*.h5
+*.hdf5
+*.pkl
+*.ckpt
+*.pt
+*.pth
+
+# --- Reports ---
+*.pdf
+*.docx
+
+# --- Others ---
+.cache/
+.mypy_cache/
+.pyre/
