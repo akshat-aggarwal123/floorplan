@@ -11,8 +11,8 @@ class FocalLoss(nn.Module):
     Focal Loss for addressing class imbalance in segmentation
     """
     
-    def _init_(self, alpha: float = 0.25, gamma: float = 2.0, ignore_index: int = -100):
-        super(FocalLoss, self)._init_()
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, ignore_index: int = -100):
+        super(FocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.ignore_index = ignore_index
@@ -34,8 +34,8 @@ class DiceLoss(nn.Module):
     Dice Loss for segmentation tasks
     """
     
-    def _init_(self, smooth: float = 1e-6, ignore_index: int = -100):
-        super(DiceLoss, self)._init_()
+    def __init__(self, smooth: float = 1e-6, ignore_index: int = -100):
+        super(DiceLoss, self).__init__()
         self.smooth = smooth
         self.ignore_index = ignore_index
         
@@ -73,13 +73,13 @@ class CombinedLoss(nn.Module):
     Combination of Cross Entropy and Dice Loss
     """
     
-    def _init_(
+    def __init__(
         self, 
         ce_weight: float = 0.5, 
         dice_weight: float = 0.5,
         ignore_index: int = -100
     ):
-        super(CombinedLoss, self)._init_()
+        super(CombinedLoss, self).__init__()
         self.ce_weight = ce_weight
         self.dice_weight = dice_weight
         
@@ -97,8 +97,8 @@ class BoundaryLoss(nn.Module):
     Specialized loss for boundary detection that emphasizes edge pixels
     """
     
-    def _init_(self, boundary_weight: float = 2.0):
-        super(BoundaryLoss, self)._init_()
+    def __init__(self, boundary_weight: float = 2.0):
+        super(BoundaryLoss, self).__init__()
         self.boundary_weight = boundary_weight
         self.ce_loss = nn.CrossEntropyLoss(reduction='none')
         
@@ -138,7 +138,7 @@ class MultiTaskLoss(nn.Module):
     Multi-task loss for room segmentation and boundary detection
     """
     
-    def _init_(
+    def __init__(
         self,
         room_weight: float = 1.0,
         boundary_weight: float = 1.0,
@@ -147,7 +147,7 @@ class MultiTaskLoss(nn.Module):
         focal_gamma: float = 2.0,
         use_boundary_enhancement: bool = True
     ):
-        super(MultiTaskLoss, self)._init_()
+        super(MultiTaskLoss, self).__init__()
         
         self.room_weight = room_weight
         self.boundary_weight = boundary_weight
@@ -216,13 +216,13 @@ class AdaptiveWeightedLoss(nn.Module):
     Adaptive loss weighting that adjusts weights during training
     """
     
-    def _init_(
+    def __init__(
         self,
         num_tasks: int = 2,
         loss_type: str = 'focal',
         temperature: float = 2.0
     ):
-        super(AdaptiveWeightedLoss, self)._init_()
+        super(AdaptiveWeightedLoss, self).__init__()
         
         # Learnable weights for each task
         self.log_vars = nn.Parameter(torch.zeros(num_tasks))
@@ -269,8 +269,8 @@ class BalancedCrossEntropyLoss(nn.Module):
     Balanced Cross Entropy Loss for handling class imbalance
     """
     
-    def _init_(self, ignore_index: int = -100):
-        super(BalancedCrossEntropyLoss, self)._init_()
+    def __init__(self, ignore_index: int = -100):
+        super(BalancedCrossEntropyLoss, self).__init__()
         self.ignore_index = ignore_index
         
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:

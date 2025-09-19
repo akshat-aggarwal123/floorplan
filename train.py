@@ -10,14 +10,13 @@ import numpy as np
 from pathlib import Path
 import argparse
 
-from models.model import SimpleFloorPlanNet
-from models.model import MultiTaskLoss
+# Fixed imports based on your folder structure
+from models.model import ModernFloorPlanNet
 from utils.data_loader import create_data_loaders_custom
-import segmentation_models_pytorch as smp
 
 class FloorPlanTrainerCustom:
     """
-    Custom trainer for your specific dataset format
+    Custom trainer for your specific dataset format with 16 room classes
     """
     
     def __init__(self, data_dir: str, config_path: str = None):
@@ -26,33 +25,27 @@ class FloorPlanTrainerCustom:
             with open(config_path, 'r') as f:
                 self.config = yaml.safe_load(f)
         else:
-            # Default config for your data
+            # Default config for your 679 images with 16 classes
             self.config = {
                 'data': {
-                    'batch_size': 2,  # Reduced for CPU
-                    'num_workers': 2,  # Reduced for CPU
+                    'batch_size': 2,  # Small batch for stability
+                    'num_workers': 0,  # Set to 0 for Windows compatibility
                     'image_size': 256,  # Reduced for faster training
                     'train_split': 0.7,
                     'val_split': 0.2
                 },
                 'model': {
-                    'backbone': 'resnet34',  # Lighter model for CPU
-                    'num_room_classes': 10,
+                    'backbone': 'efficientnet-b4',
+                    'num_room_classes': 16,  # Your 16 classes
                     'num_boundary_classes': 3,
                     'dropout': 0.1
                 },
                 'training': {
-                    'epochs': 50,  # Reduced epochs
+                    'epochs': 50,
                     'learning_rate': 0.001,
                     'weight_decay': 1e-4,
                     'mixed_precision': False,  # Disable for CPU
                     'early_stopping_patience': 10
-                },
-                'loss': {
-                    'room_weight': 1.0,
-                    'boundary_weight': 1.0,
-                    'focal_loss_alpha': 0.25,
-                    'focal_loss_gamma': 2.0
                 },
                 'output': {
                     'checkpoint_dir': 'checkpoints',
@@ -72,21 +65,16 @@ class FloorPlanTrainerCustom:
             dir_path.mkdir(parents=True, exist_ok=True)
         
         # Initialize model
-        self.model = SimpleFloorPlanNet(
+        self.model = ModernFloorPlanNet(
             encoder_name=self.config['model']['backbone'],
             num_room_classes=self.config['model']['num_room_classes'],
             num_boundary_classes=self.config['model']['num_boundary_classes'],
             dropout=self.config['model']['dropout']
         ).to(self.device)
         
-        # Initialize loss function
-        self.criterion = MultiTaskLoss(
-            room_weight=self.config['loss']['room_weight'],
-            boundary_weight=self.config['loss']['boundary_weight'],
-            use_focal_loss=True,
-            focal_alpha=self.config['loss']['focal_loss_alpha'],
-            focal_gamma=self.config['loss']['focal_loss_gamma']
-        )
+        # Initialize simple loss functions (instead of complex MultiTaskLoss)
+        self.room_criterion = torch.nn.CrossEntropyLoss()
+        self.boundary_criterion = torch.nn.CrossEntropyLoss()
         
         # Initialize optimizer
         self.optimizer = torch.optim.AdamW(
@@ -114,6 +102,7 @@ class FloorPlanTrainerCustom:
             self.scaler = torch.cuda.amp.GradScaler()
         else:
             self.scaler = None
+            print("Mixed precision disabled (CPU or config setting)")
         
         # Data directory
         self.data_dir = data_dir
@@ -121,10 +110,10 @@ class FloorPlanTrainerCustom:
     def _calculate_iou(self, pred, target, num_classes=None):
         """Calculate IoU score"""
         if num_classes is None:
-            num_classes = max(torch.max(pred), torch.max(target)) + 1
+            num_classes = max(torch.max(pred).item(), torch.max(target).item()) + 1
         
         iou_scores = []
-        for cls in range(num_classes):
+        for cls in range(1, num_classes):  # Skip background (class 0)
             pred_cls = (pred == cls)
             target_cls = (target == cls)
             
@@ -138,7 +127,7 @@ class FloorPlanTrainerCustom:
             
             iou_scores.append(iou)
         
-        return torch.stack(iou_scores).mean()
+        return torch.stack(iou_scores).mean() if iou_scores else torch.tensor(0.0)
         
     def train_epoch(self, train_loader, epoch):
         """Train for one epoch"""
@@ -152,8 +141,8 @@ class FloorPlanTrainerCustom:
         for batch_idx, batch in enumerate(pbar):
             try:
                 images = batch['image'].to(self.device)
-                room_masks = batch['room_mask'].to(self.device).long()
-                boundary_masks = batch['boundary_mask'].to(self.device).long()
+                room_masks = batch['room_mask'].to(self.device)
+                boundary_masks = batch['boundary_mask'].to(self.device)
                 
                 self.optimizer.zero_grad()
                 
@@ -162,18 +151,10 @@ class FloorPlanTrainerCustom:
                     with torch.cuda.amp.autocast():
                         predictions = self.model(images)
                         
-                        targets = {
-                            'room': room_masks,
-                            'boundary': boundary_masks
-                        }
-                        
-                        loss_dict = self.criterion(predictions, targets)
-                        
-                        loss = loss_dict['loss']
-                        print("\n\n--- DEBUG INFO ---")
-                        print(f"Type of returned loss: {type(loss_dict)}")
-                        print(f"Content of returned loss: {loss_dict}")
-                        print("--- END OF DEBUG INFO ---\n\n")
+                        # Calculate losses using simple criterion
+                        room_loss = self.room_criterion(predictions['room_logits'], room_masks)
+                        boundary_loss = self.boundary_criterion(predictions['boundary_logits'], boundary_masks)
+                        loss = room_loss + boundary_loss
                     
                     self.scaler.scale(loss).backward()
                     self.scaler.step(self.optimizer)
@@ -182,14 +163,11 @@ class FloorPlanTrainerCustom:
                     # Regular training
                     predictions = self.model(images)
                     
-                    targets = {
-                        'room': room_masks,
-                        'boundary': boundary_masks
-                    }
+                    # Calculate losses using simple criterion
+                    room_loss = self.room_criterion(predictions['room_logits'], room_masks)
+                    boundary_loss = self.boundary_criterion(predictions['boundary_logits'], boundary_masks)
+                    loss = room_loss + boundary_loss
                     
-                    loss = self.criterion(predictions, targets)
-                    
-                   
                     loss.backward()
                     self.optimizer.step()
                 
@@ -201,8 +179,8 @@ class FloorPlanTrainerCustom:
                 room_pred_class = torch.argmax(room_pred, dim=1)
                 boundary_pred_class = torch.argmax(boundary_pred, dim=1)
                 
-                room_iou = self._calculate_iou(room_pred_class, room_masks)
-                boundary_iou = self._calculate_iou(boundary_pred_class, boundary_masks)
+                room_iou = self._calculate_iou(room_pred_class, room_masks, self.config['model']['num_room_classes'])
+                boundary_iou = self._calculate_iou(boundary_pred_class, boundary_masks, self.config['model']['num_boundary_classes'])
                 
                 room_scores.append(room_iou.item())
                 boundary_scores.append(boundary_iou.item())
@@ -216,11 +194,13 @@ class FloorPlanTrainerCustom:
                 })
                 
             except Exception as e:
-                print(f"Error in batch {batch_idx}: {e}")
+                print(f"\nError in batch {batch_idx}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
         
         # Calculate average metrics
-        avg_loss = total_loss / len(train_loader)
+        avg_loss = total_loss / max(len(train_loader), 1)
         avg_room_iou = np.mean(room_scores) if room_scores else 0.0
         avg_boundary_iou = np.mean(boundary_scores) if boundary_scores else 0.0
         
@@ -237,8 +217,8 @@ class FloorPlanTrainerCustom:
             for batch in tqdm(val_loader, desc='Validation'):
                 try:
                     images = batch['image'].to(self.device)
-                    room_masks = batch['room_mask'].to(self.device).long()
-                    boundary_masks = batch['boundary_mask'].to(self.device).long()
+                    room_masks = batch['room_mask'].to(self.device)
+                    boundary_masks = batch['boundary_mask'].to(self.device)
                     
                     if self.scaler:
                         with torch.cuda.amp.autocast():
@@ -246,13 +226,10 @@ class FloorPlanTrainerCustom:
                     else:
                         predictions = self.model(images)
                     
-                    targets = {
-                        'room': room_masks,
-                        'boundary': boundary_masks
-                    }
-                    
-                    loss_dict = self.criterion(predictions, targets)
-                    loss = loss_dict['loss']
+                    # Calculate losses using simple criterion
+                    room_loss = self.room_criterion(predictions['room_logits'], room_masks)
+                    boundary_loss = self.boundary_criterion(predictions['boundary_logits'], boundary_masks)
+                    loss = room_loss + boundary_loss
                     
                     # Calculate metrics
                     room_pred = torch.softmax(predictions['room_logits'], dim=1)
@@ -261,19 +238,19 @@ class FloorPlanTrainerCustom:
                     room_pred_class = torch.argmax(room_pred, dim=1)
                     boundary_pred_class = torch.argmax(boundary_pred, dim=1)
                     
-                    room_iou = self._calculate_iou(room_pred_class, room_masks)
-                    boundary_iou = self._calculate_iou(boundary_pred_class, boundary_masks)
+                    room_iou = self._calculate_iou(room_pred_class, room_masks, self.config['model']['num_room_classes'])
+                    boundary_iou = self._calculate_iou(boundary_pred_class, boundary_masks, self.config['model']['num_boundary_classes'])
                     
                     room_scores.append(room_iou.item())
                     boundary_scores.append(boundary_iou.item())
                     total_loss += loss.item()
                     
                 except Exception as e:
-                    print(f"Error in validation batch: {e}")
+                    print(f"\nError in validation batch: {e}")
                     continue
         
         # Calculate average metrics
-        avg_loss = total_loss / len(val_loader) if len(val_loader) > 0 else 0.0
+        avg_loss = total_loss / max(len(val_loader), 1)
         avg_room_iou = np.mean(room_scores) if room_scores else 0.0
         avg_boundary_iou = np.mean(boundary_scores) if boundary_scores else 0.0
         
@@ -296,6 +273,8 @@ class FloorPlanTrainerCustom:
         except Exception as e:
             print(f"Error creating data loaders: {e}")
             print("Make sure your utils/data_loader.py has the create_data_loaders_custom function")
+            import traceback
+            traceback.print_exc()
             return
         
         print(f"Created train loader with {len(train_loader)} batches")
@@ -325,7 +304,7 @@ class FloorPlanTrainerCustom:
             val_score = (val_room_iou + val_boundary_iou) / 2
             
             # Logging
-            print(f'Epoch {epoch+1}/{self.config["training"]["epochs"]}:')
+            print(f'\nEpoch {epoch+1}/{self.config["training"]["epochs"]}:')
             print(f'  Train Loss: {train_loss:.4f}, Room IoU: {train_room_iou:.4f}, Boundary IoU: {train_boundary_iou:.4f}')
             print(f'  Val Loss: {val_loss:.4f}, Room IoU: {val_room_iou:.4f}, Boundary IoU: {val_boundary_iou:.4f}')
             print(f'  LR: {current_lr:.6f}')
@@ -351,7 +330,11 @@ class FloorPlanTrainerCustom:
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'scheduler_state_dict': self.scheduler.state_dict(),
                     'best_val_score': self.best_val_score,
-                    'config': self.config
+                    'config': self.config,
+                    'class_mapping': {
+                        0: 0, 1: 1, 180: 2, 181: 3, 194: 4, 195: 5, 221: 6, 222: 7,
+                        223: 8, 224: 9, 232: 10, 233: 11, 235: 12, 236: 13, 237: 14, 238: 15
+                    }
                 }
                 
                 torch.save(checkpoint, self.checkpoint_dir / 'best_model.pth')
@@ -377,11 +360,13 @@ class FloorPlanTrainerCustom:
                 }
                 torch.save(checkpoint, self.checkpoint_dir / f'checkpoint_epoch_{epoch+1}.pth')
         
-        print("Training completed!")
+        print("\nTraining completed!")
+        print(f"Best validation score: {self.best_val_score:.4f}")
+        print(f"Best model saved at: {self.checkpoint_dir / 'best_model.pth'}")
         self.writer.close()
 
 def main():
-    parser = argparse.ArgumentParser(description='Train Floor Plan Recognition Model on Custom Data')
+    parser = argparse.ArgumentParser(description='Train Floor Plan Recognition Model')
     parser.add_argument('--data_dir', type=str, required=True,
                         help='Path to your dataset directory')
     parser.add_argument('--config', type=str, default=None,
@@ -389,9 +374,19 @@ def main():
     
     args = parser.parse_args()
     
+    # Check if data directory exists
+    if not os.path.exists(args.data_dir):
+        print(f"Error: Data directory '{args.data_dir}' does not exist!")
+        return
+    
     # Initialize trainer and start training
-    trainer = FloorPlanTrainerCustom(args.data_dir, args.config)
-    trainer.train()
+    try:
+        trainer = FloorPlanTrainerCustom(args.data_dir, args.config)
+        trainer.train()
+    except Exception as e:
+        print(f"Error during training: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == '__main__':
     main()
