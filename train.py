@@ -11,7 +11,7 @@ from pathlib import Path
 import argparse
 
 # Fixed imports based on your folder structure
-from models.model import ModernFloorPlanNet
+from models.model import ModernFloorPlanNet, get_stable_model_for_training
 from utils.data_loader import create_data_loaders_custom
 
 class FloorPlanTrainerCustom:
@@ -28,9 +28,9 @@ class FloorPlanTrainerCustom:
             # Default config for your 679 images with 16 classes
             self.config = {
                 'data': {
-                    'batch_size': 2,  # Small batch for stability
-                    'num_workers': 0,  # Set to 0 for Windows compatibility
-                    'image_size': 256,  # Reduced for faster training
+                    'batch_size': 4,  # Increased for CUDA
+                    'num_workers': 4,  # For CUDA parallel loading
+                    'image_size': 256,
                     'train_split': 0.7,
                     'val_split': 0.2
                 },
@@ -44,7 +44,7 @@ class FloorPlanTrainerCustom:
                     'epochs': 50,
                     'learning_rate': 0.001,
                     'weight_decay': 1e-4,
-                    'mixed_precision': False,  # Disable for CPU
+                    'mixed_precision': True,  # Enable for CUDA
                     'early_stopping_patience': 10
                 },
                 'output': {
@@ -53,9 +53,14 @@ class FloorPlanTrainerCustom:
                 }
             }
         
-        # Setup device
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Setup device - Force CUDA
+        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available! Please check your GPU setup.")
+        
         print(f"Using device: {self.device}")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
         
         # Create directories
         self.checkpoint_dir = Path(self.config['output']['checkpoint_dir'])
@@ -65,16 +70,11 @@ class FloorPlanTrainerCustom:
             dir_path.mkdir(parents=True, exist_ok=True)
         
         # Initialize model
-        self.model = ModernFloorPlanNet(
-            encoder_name=self.config['model']['backbone'],
-            num_room_classes=self.config['model']['num_room_classes'],
-            num_boundary_classes=self.config['model']['num_boundary_classes'],
-            dropout=self.config['model']['dropout']
-        ).to(self.device)
+        self.model = get_stable_model_for_training().to(self.device)
         
-        # Initialize simple loss functions (instead of complex MultiTaskLoss)
-        self.room_criterion = torch.nn.CrossEntropyLoss()
-        self.boundary_criterion = torch.nn.CrossEntropyLoss()
+        # Initialize loss functions with CUDA support
+        self.room_criterion = torch.nn.CrossEntropyLoss().to(self.device)
+        self.boundary_criterion = torch.nn.CrossEntropyLoss().to(self.device)
         
         # Initialize optimizer
         self.optimizer = torch.optim.AdamW(
@@ -97,18 +97,25 @@ class FloorPlanTrainerCustom:
         self.best_val_score = 0.0
         self.patience_counter = 0
         
-        # Mixed precision training - only if using GPU
-        if self.device.type == 'cuda' and self.config['training']['mixed_precision']:
+        # Mixed precision training for CUDA
+        if self.config['training']['mixed_precision']:
             self.scaler = torch.cuda.amp.GradScaler()
+            print("Mixed precision training enabled")
         else:
             self.scaler = None
-            print("Mixed precision disabled (CPU or config setting)")
+            print("Mixed precision disabled")
         
         # Data directory
         self.data_dir = data_dir
     
     def _calculate_iou(self, pred, target, num_classes=None):
-        """Calculate IoU score"""
+        """Calculate IoU score with proper CUDA handling"""
+        device = self.device
+        
+        # Ensure tensors are on CUDA
+        pred = pred.to(device)
+        target = target.to(device)
+        
         if num_classes is None:
             num_classes = max(torch.max(pred).item(), torch.max(target).item()) + 1
         
@@ -123,14 +130,18 @@ class FloorPlanTrainerCustom:
             if union > 0:
                 iou = intersection / union
             else:
-                iou = torch.tensor(1.0 if intersection == 0 else 0.0)
+                # Create tensor on correct device
+                iou = torch.tensor(1.0 if intersection == 0 else 0.0, device=device)
             
-            iou_scores.append(iou)
+            iou_scores.append(iou.to(device))
         
-        return torch.stack(iou_scores).mean() if iou_scores else torch.tensor(0.0)
+        if iou_scores:
+            return torch.stack(iou_scores).mean()
+        else:
+            return torch.tensor(0.0, device=device)
         
     def train_epoch(self, train_loader, epoch):
-        """Train for one epoch"""
+        """Train for one epoch with CUDA optimization"""
         self.model.train()
         total_loss = 0.0
         room_scores = []
@@ -140,20 +151,29 @@ class FloorPlanTrainerCustom:
         
         for batch_idx, batch in enumerate(pbar):
             try:
-                images = batch['image'].to(self.device)
-                room_masks = batch['room_mask'].to(self.device)
-                boundary_masks = batch['boundary_mask'].to(self.device)
+                # Move all data to CUDA with non_blocking for speed
+                images = batch['image'].to(self.device, non_blocking=True)
+                room_masks = batch['room_mask'].to(self.device, non_blocking=True)
+                boundary_masks = batch['boundary_mask'].to(self.device, non_blocking=True)
+                
+                # Ensure data types are correct
+                room_masks = room_masks.long()
+                boundary_masks = boundary_masks.long()
                 
                 self.optimizer.zero_grad()
                 
                 if self.scaler:
-                    # Mixed precision training (GPU only)
+                    # Mixed precision training
                     with torch.cuda.amp.autocast():
                         predictions = self.model(images)
                         
-                        # Calculate losses using simple criterion
-                        room_loss = self.room_criterion(predictions['room_logits'], room_masks)
-                        boundary_loss = self.boundary_criterion(predictions['boundary_logits'], boundary_masks)
+                        # Ensure predictions are on CUDA
+                        room_logits = predictions['room_logits'].to(self.device)
+                        boundary_logits = predictions['boundary_logits'].to(self.device)
+                        
+                        # Calculate losses
+                        room_loss = self.room_criterion(room_logits, room_masks)
+                        boundary_loss = self.boundary_criterion(boundary_logits, boundary_masks)
                         loss = room_loss + boundary_loss
                     
                     self.scaler.scale(loss).backward()
@@ -163,40 +183,56 @@ class FloorPlanTrainerCustom:
                     # Regular training
                     predictions = self.model(images)
                     
-                    # Calculate losses using simple criterion
-                    room_loss = self.room_criterion(predictions['room_logits'], room_masks)
-                    boundary_loss = self.boundary_criterion(predictions['boundary_logits'], boundary_masks)
+                    # Ensure predictions are on CUDA
+                    room_logits = predictions['room_logits'].to(self.device)
+                    boundary_logits = predictions['boundary_logits'].to(self.device)
+                    
+                    # Calculate losses
+                    room_loss = self.room_criterion(room_logits, room_masks)
+                    boundary_loss = self.boundary_criterion(boundary_logits, boundary_masks)
                     loss = room_loss + boundary_loss
                     
                     loss.backward()
                     self.optimizer.step()
                 
-                # Calculate metrics
-                room_pred = torch.softmax(predictions['room_logits'], dim=1)
-                boundary_pred = torch.softmax(predictions['boundary_logits'], dim=1)
-                
-                # Convert to class predictions
-                room_pred_class = torch.argmax(room_pred, dim=1)
-                boundary_pred_class = torch.argmax(boundary_pred, dim=1)
-                
-                room_iou = self._calculate_iou(room_pred_class, room_masks, self.config['model']['num_room_classes'])
-                boundary_iou = self._calculate_iou(boundary_pred_class, boundary_masks, self.config['model']['num_boundary_classes'])
-                
-                room_scores.append(room_iou.item())
-                boundary_scores.append(boundary_iou.item())
-                total_loss += loss.item()
+                # Calculate metrics with CUDA tensors
+                with torch.no_grad():
+                    room_pred = torch.softmax(room_logits, dim=1)
+                    boundary_pred = torch.softmax(boundary_logits, dim=1)
+                    
+                    # Convert to class predictions
+                    room_pred_class = torch.argmax(room_pred, dim=1)
+                    boundary_pred_class = torch.argmax(boundary_pred, dim=1)
+                    
+                    room_iou = self._calculate_iou(room_pred_class, room_masks, self.config['model']['num_room_classes'])
+                    boundary_iou = self._calculate_iou(boundary_pred_class, boundary_masks, self.config['model']['num_boundary_classes'])
+                    
+                    room_scores.append(room_iou.item())
+                    boundary_scores.append(boundary_iou.item())
+                    total_loss += loss.item()
                 
                 # Update progress bar
                 pbar.set_postfix({
                     'loss': f'{loss.item():.4f}',
                     'room_iou': f'{room_iou.item():.4f}',
-                    'boundary_iou': f'{boundary_iou.item():.4f}'
+                    'boundary_iou': f'{boundary_iou.item():.4f}',
+                    'gpu_mem': f'{torch.cuda.memory_allocated()/1024**2:.0f}MB'
                 })
+                
+                # Clear cache periodically to prevent memory issues
+                if batch_idx % 50 == 0:
+                    torch.cuda.empty_cache()
                 
             except Exception as e:
                 print(f"\nError in batch {batch_idx}: {e}")
+                print(f"Batch shapes - Images: {batch['image'].shape if 'image' in batch else 'None'}")
+                print(f"Room masks: {batch['room_mask'].shape if 'room_mask' in batch else 'None'}")
+                print(f"Boundary masks: {batch['boundary_mask'].shape if 'boundary_mask' in batch else 'None'}")
                 import traceback
                 traceback.print_exc()
+                
+                # Clear CUDA cache on error
+                torch.cuda.empty_cache()
                 continue
         
         # Calculate average metrics
@@ -207,7 +243,7 @@ class FloorPlanTrainerCustom:
         return avg_loss, avg_room_iou, avg_boundary_iou
     
     def validate_epoch(self, val_loader, epoch):
-        """Validate for one epoch"""
+        """Validate for one epoch with CUDA optimization"""
         self.model.eval()
         total_loss = 0.0
         room_scores = []
@@ -216,9 +252,14 @@ class FloorPlanTrainerCustom:
         with torch.no_grad():
             for batch in tqdm(val_loader, desc='Validation'):
                 try:
-                    images = batch['image'].to(self.device)
-                    room_masks = batch['room_mask'].to(self.device)
-                    boundary_masks = batch['boundary_mask'].to(self.device)
+                    # Move all data to CUDA
+                    images = batch['image'].to(self.device, non_blocking=True)
+                    room_masks = batch['room_mask'].to(self.device, non_blocking=True)
+                    boundary_masks = batch['boundary_mask'].to(self.device, non_blocking=True)
+                    
+                    # Ensure data types are correct
+                    room_masks = room_masks.long()
+                    boundary_masks = boundary_masks.long()
                     
                     if self.scaler:
                         with torch.cuda.amp.autocast():
@@ -226,14 +267,18 @@ class FloorPlanTrainerCustom:
                     else:
                         predictions = self.model(images)
                     
-                    # Calculate losses using simple criterion
-                    room_loss = self.room_criterion(predictions['room_logits'], room_masks)
-                    boundary_loss = self.boundary_criterion(predictions['boundary_logits'], boundary_masks)
+                    # Ensure predictions are on CUDA
+                    room_logits = predictions['room_logits'].to(self.device)
+                    boundary_logits = predictions['boundary_logits'].to(self.device)
+                    
+                    # Calculate losses
+                    room_loss = self.room_criterion(room_logits, room_masks)
+                    boundary_loss = self.boundary_criterion(boundary_logits, boundary_masks)
                     loss = room_loss + boundary_loss
                     
                     # Calculate metrics
-                    room_pred = torch.softmax(predictions['room_logits'], dim=1)
-                    boundary_pred = torch.softmax(predictions['boundary_logits'], dim=1)
+                    room_pred = torch.softmax(room_logits, dim=1)
+                    boundary_pred = torch.softmax(boundary_logits, dim=1)
                     
                     room_pred_class = torch.argmax(room_pred, dim=1)
                     boundary_pred_class = torch.argmax(boundary_pred, dim=1)
@@ -247,6 +292,7 @@ class FloorPlanTrainerCustom:
                     
                 except Exception as e:
                     print(f"\nError in validation batch: {e}")
+                    torch.cuda.empty_cache()
                     continue
         
         # Calculate average metrics
@@ -308,6 +354,7 @@ class FloorPlanTrainerCustom:
             print(f'  Train Loss: {train_loss:.4f}, Room IoU: {train_room_iou:.4f}, Boundary IoU: {train_boundary_iou:.4f}')
             print(f'  Val Loss: {val_loss:.4f}, Room IoU: {val_room_iou:.4f}, Boundary IoU: {val_boundary_iou:.4f}')
             print(f'  LR: {current_lr:.6f}')
+            print(f'  GPU Memory: {torch.cuda.memory_allocated()/1024**2:.0f}MB / {torch.cuda.memory_reserved()/1024**2:.0f}MB')
             
             # TensorBoard logging
             self.writer.add_scalar('Loss/Train', train_loss, epoch)
@@ -317,6 +364,7 @@ class FloorPlanTrainerCustom:
             self.writer.add_scalar('IoU/Val_Room', val_room_iou, epoch)
             self.writer.add_scalar('IoU/Val_Boundary', val_boundary_iou, epoch)
             self.writer.add_scalar('Learning_Rate', current_lr, epoch)
+            self.writer.add_scalar('GPU_Memory_MB', torch.cuda.memory_allocated()/1024**2, epoch)
             
             # Save best model
             if val_score > self.best_val_score:
@@ -359,6 +407,9 @@ class FloorPlanTrainerCustom:
                     'config': self.config
                 }
                 torch.save(checkpoint, self.checkpoint_dir / f'checkpoint_epoch_{epoch+1}.pth')
+            
+            # Clear CUDA cache at the end of each epoch
+            torch.cuda.empty_cache()
         
         print("\nTraining completed!")
         print(f"Best validation score: {self.best_val_score:.4f}")
@@ -379,6 +430,11 @@ def main():
         print(f"Error: Data directory '{args.data_dir}' does not exist!")
         return
     
+    # Check CUDA availability
+    if not torch.cuda.is_available():
+        print("Error: CUDA is not available! Please install PyTorch with CUDA support.")
+        return
+    
     # Initialize trainer and start training
     try:
         trainer = FloorPlanTrainerCustom(args.data_dir, args.config)
@@ -387,6 +443,10 @@ def main():
         print(f"Error during training: {e}")
         import traceback
         traceback.print_exc()
+        
+        # Clear CUDA cache on exit
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 if __name__ == '__main__':
     main()

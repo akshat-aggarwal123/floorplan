@@ -23,6 +23,10 @@ class AttentionBlock(nn.Module):
         """
         Apply attention mechanism between room and boundary features
         """
+        # Ensure tensors are on the same device
+        if room_features.device != boundary_features.device:
+            boundary_features = boundary_features.to(room_features.device)
+        
         # Concatenate features
         combined = torch.cat([room_features, boundary_features], dim=1)
         
@@ -49,6 +53,10 @@ class CrossTaskFusion(nn.Module):
         
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         """Fuse features from two tasks"""
+        # Ensure tensors are on the same device
+        if x1.device != x2.device:
+            x2 = x2.to(x1.device)
+        
         combined = torch.cat([x1, x2], dim=1)
         fused = self.fusion_conv(combined)
         return fused + x1  # Residual connection
@@ -62,7 +70,7 @@ class ModernFloorPlanNet(nn.Module):
     def __init__(
         self, 
         encoder_name: str = "efficientnet-b4",
-        num_room_classes: int = 9,
+        num_room_classes: int = 16,  # Fixed to match your 16 classes
         num_boundary_classes: int = 3,
         dropout: float = 0.1,
         use_attention: bool = False  # Start with False for stability
@@ -104,9 +112,23 @@ class ModernFloorPlanNet(nn.Module):
             self.room_dropout = nn.Identity()
             self.boundary_dropout = nn.Identity()
         
+        # Initialize weights properly for CUDA
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """Initialize weights for better CUDA training stability"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+        
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        Forward pass
+        Forward pass with CUDA device consistency
         
         Args:
             x: Input image tensor [B, 3, H, W]
@@ -114,9 +136,17 @@ class ModernFloorPlanNet(nn.Module):
         Returns:
             Dictionary containing room and boundary predictions
         """
+        # Ensure input is on the correct device
+        device = next(self.parameters()).device
+        x = x.to(device)
+        
         # Get predictions from both branches
         room_logits = self.room_net(x)
         boundary_logits = self.boundary_net(x)
+        
+        # Ensure outputs are on the same device
+        room_logits = room_logits.to(device)
+        boundary_logits = boundary_logits.to(device)
         
         if self.use_attention:
             # Apply cross-task attention
@@ -134,14 +164,14 @@ class ModernFloorPlanNet(nn.Module):
 
 class SimpleFloorPlanNet(nn.Module):
     """
-    Simplified Floor Plan Network - most reliable option
+    Simplified Floor Plan Network - most reliable option for CUDA training
     Uses separate Unet models for each task
     """
     
     def __init__(
         self, 
         encoder_name: str = "efficientnet-b4",
-        num_room_classes: int = 9,
+        num_room_classes: int = 16,  # Fixed to match your 16 classes
         num_boundary_classes: int = 3,
         dropout: float = 0.1
     ):
@@ -150,21 +180,38 @@ class SimpleFloorPlanNet(nn.Module):
         self.num_room_classes = num_room_classes
         self.num_boundary_classes = num_boundary_classes
         
-        # Room segmentation network
-        self.room_net = smp.Unet(
-            encoder_name=encoder_name,
-            encoder_weights="imagenet",
-            in_channels=3,
-            classes=num_room_classes,
-        )
-        
-        # Boundary detection network
-        self.boundary_net = smp.Unet(
-            encoder_name=encoder_name,
-            encoder_weights="imagenet",
-            in_channels=3,
-            classes=num_boundary_classes,
-        )
+        try:
+            # Room segmentation network
+            self.room_net = smp.Unet(
+                encoder_name=encoder_name,
+                encoder_weights="imagenet",
+                in_channels=3,
+                classes=num_room_classes,
+            )
+            
+            # Boundary detection network
+            self.boundary_net = smp.Unet(
+                encoder_name=encoder_name,
+                encoder_weights="imagenet",
+                in_channels=3,
+                classes=num_boundary_classes,
+            )
+        except Exception as e:
+            print(f"Error creating model with {encoder_name}, falling back to resnet34: {e}")
+            # Fallback to a more stable encoder
+            self.room_net = smp.Unet(
+                encoder_name="resnet34",
+                encoder_weights="imagenet",
+                in_channels=3,
+                classes=num_room_classes,
+            )
+            
+            self.boundary_net = smp.Unet(
+                encoder_name="resnet34",
+                encoder_weights="imagenet", 
+                in_channels=3,
+                classes=num_boundary_classes,
+            )
         
         # Optional dropout layers
         if dropout > 0:
@@ -174,25 +221,49 @@ class SimpleFloorPlanNet(nn.Module):
             self.room_dropout = nn.Identity()
             self.boundary_dropout = nn.Identity()
         
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Forward pass"""
-        room_logits = self.room_dropout(self.room_net(x))
-        boundary_logits = self.boundary_dropout(self.boundary_net(x))
+        # Initialize weights
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """Initialize weights for better training stability"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
         
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Forward pass with device consistency"""
+        # Ensure input is on the correct device
+        device = next(self.parameters()).device
+        x = x.to(device)
+        
+        # Forward pass
+        room_logits = self.room_net(x)
+        boundary_logits = self.boundary_net(x)
+        
+        # Apply dropout
+        room_logits = self.room_dropout(room_logits)
+        boundary_logits = self.boundary_dropout(boundary_logits)
+        
+        # Ensure outputs are on correct device
         return {
-            'room_logits': room_logits,
-            'boundary_logits': boundary_logits
+            'room_logits': room_logits.to(device),
+            'boundary_logits': boundary_logits.to(device)
         }
 
 class LightweightFloorPlanNet(nn.Module):
     """
-    Lightweight version using ResNet backbone - faster training
+    Lightweight version using ResNet backbone - faster training and more stable
     """
     
     def __init__(
         self, 
         encoder_name: str = "resnet34",
-        num_room_classes: int = 9,
+        num_room_classes: int = 16,  # Fixed to match your 16 classes
         num_boundary_classes: int = 3,
         dropout: float = 0.1
     ):
@@ -225,25 +296,42 @@ class LightweightFloorPlanNet(nn.Module):
             self.room_dropout = nn.Identity()
             self.boundary_dropout = nn.Identity()
         
+        # Initialize weights
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """Initialize weights for better training stability"""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+        
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Forward pass"""
+        """Forward pass with device consistency"""
+        device = next(self.parameters()).device
+        x = x.to(device)
+        
         room_logits = self.room_dropout(self.room_net(x))
         boundary_logits = self.boundary_dropout(self.boundary_net(x))
         
         return {
-            'room_logits': room_logits,
-            'boundary_logits': boundary_logits
+            'room_logits': room_logits.to(device),
+            'boundary_logits': boundary_logits.to(device)
         }
 
-# Multi-task loss function
+# Multi-task loss function with CUDA support
 class MultiTaskLoss(nn.Module):
-    """Multi-task loss combining room and boundary losses"""
+    """Multi-task loss combining room and boundary losses with CUDA optimization"""
     
     def __init__(
         self, 
         room_weight: float = 1.0, 
         boundary_weight: float = 1.0,
-        use_focal_loss: bool = True,
+        use_focal_loss: bool = False,  # Disabled by default for stability
         focal_alpha: float = 1.0,
         focal_gamma: float = 2.0
     ):
@@ -257,20 +345,26 @@ class MultiTaskLoss(nn.Module):
             self.room_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
             self.boundary_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
         else:
-            # Standard cross-entropy loss
-            self.room_loss = nn.CrossEntropyLoss()
-            self.boundary_loss = nn.CrossEntropyLoss()
+            # Standard cross-entropy loss with label smoothing for better training
+            self.room_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
+            self.boundary_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
             
     def forward(self, predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        Compute multi-task loss
+        Compute multi-task loss with device consistency
         
         Args:
             predictions: Dictionary with 'room_logits' and 'boundary_logits'
             targets: Dictionary with 'room' and 'boundary' ground truth
         """
-        room_loss = self.room_loss(predictions['room_logits'], targets['room'])
-        boundary_loss = self.boundary_loss(predictions['boundary_logits'], targets['boundary'])
+        # Ensure all tensors are on the same device
+        device = predictions['room_logits'].device
+        
+        room_targets = targets['room'].to(device)
+        boundary_targets = targets['boundary'].to(device)
+        
+        room_loss = self.room_loss(predictions['room_logits'], room_targets)
+        boundary_loss = self.boundary_loss(predictions['boundary_logits'], boundary_targets)
         
         total_loss = self.room_weight * room_loss + self.boundary_weight * boundary_loss
         
@@ -281,7 +375,7 @@ class MultiTaskLoss(nn.Module):
         }
 
 class FocalLoss(nn.Module):
-    """Focal Loss for handling class imbalance"""
+    """Focal Loss for handling class imbalance with CUDA support"""
     
     def __init__(self, alpha: float = 1.0, gamma: float = 2.0, reduction: str = 'mean'):
         super(FocalLoss, self).__init__()
@@ -290,6 +384,10 @@ class FocalLoss(nn.Module):
         self.reduction = reduction
         
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Ensure tensors are on the same device
+        device = inputs.device
+        targets = targets.to(device)
+        
         ce_loss = F.cross_entropy(inputs, targets, reduction='none')
         pt = torch.exp(-ce_loss)
         focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
@@ -304,7 +402,7 @@ class FocalLoss(nn.Module):
 # Backward compatibility alias
 FloorPlanLoss = MultiTaskLoss
 
-# Factory function to create models
+# Factory function to create models with better defaults
 def create_model(model_type: str = "simple", **kwargs) -> nn.Module:
     """
     Factory function to create different model variants
@@ -313,23 +411,50 @@ def create_model(model_type: str = "simple", **kwargs) -> nn.Module:
         model_type: One of ['simple', 'modern', 'lightweight']
         **kwargs: Model-specific arguments
     """
+    # Set default values for your dataset
+    default_kwargs = {
+        'num_room_classes': 16,
+        'num_boundary_classes': 3,
+        'dropout': 0.1
+    }
+    default_kwargs.update(kwargs)
+    
     if model_type == "simple":
-        return SimpleFloorPlanNet(**kwargs)
+        return SimpleFloorPlanNet(**default_kwargs)
     elif model_type == "modern":
-        return ModernFloorPlanNet(**kwargs)
+        return ModernFloorPlanNet(**default_kwargs)
     elif model_type == "lightweight":
-        return LightweightFloorPlanNet(**kwargs)
+        return LightweightFloorPlanNet(**default_kwargs)
     else:
         raise ValueError(f"Unknown model type: {model_type}. Choose from: simple, modern, lightweight")
 
 # For backward compatibility with existing training code
-def get_model(encoder_name="efficientnet-b4", num_room_classes=9, num_boundary_classes=3, **kwargs):
-    """Backward compatibility function"""
+def get_model(encoder_name="efficientnet-b4", num_room_classes=16, num_boundary_classes=3, **kwargs):
+    """Backward compatibility function with correct defaults"""
     return SimpleFloorPlanNet(
         encoder_name=encoder_name,
         num_room_classes=num_room_classes,
         num_boundary_classes=num_boundary_classes,
         **kwargs
+    )
+
+# Model factory for specific use cases
+def get_stable_model_for_training():
+    """Get the most stable model configuration for your training"""
+    return LightweightFloorPlanNet(
+        encoder_name="resnet34",
+        num_room_classes=16,
+        num_boundary_classes=3,
+        dropout=0.1
+    )
+
+def get_performance_model_for_training():
+    """Get a higher-performance model once basic training is working"""
+    return SimpleFloorPlanNet(
+        encoder_name="efficientnet-b4",
+        num_room_classes=16,
+        num_boundary_classes=3,
+        dropout=0.1
     )
 
 # Export all important classes and functions
@@ -341,5 +466,7 @@ __all__ = [
     'FloorPlanLoss',
     'FocalLoss',
     'create_model',
-    'get_model'
+    'get_model',
+    'get_stable_model_for_training',
+    'get_performance_model_for_training'
 ]
